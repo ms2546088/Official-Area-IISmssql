@@ -1,0 +1,114 @@
+# ===== Docker IIS+MSSQL 服務編排 =====
+# 專案: Official-Area_IISmssql
+# 生成日期: 2025-12-05
+# 更新日期: 2026-01-29
+# 包含: SSLH + Nginx (模擬 IIS 10.0) + PHP 8.3-FPM (MSSQL) + MS SQL Server 2022
+# 更新: 新增 SSLH 端口多路復用，58080 同時提供 HTTP + SSH
+# ms2546088筆記-2026-01-29 新增 SSLH 容器支援遠端管理
+# ============================================================
+
+services:
+  # ===== MS SQL Server 2022 (必須先啟動) =====
+  mssql:
+    image: ${MSSQL_IMAGE:-mcr.microsoft.com/mssql/server:2022-latest}
+    container_name: ${MSSQL_CONTAINER_NAME:-docker_iismssql_mssql}
+    network_mode: host
+    # 以 root 用戶運行以解決權限問題
+    user: root
+    environment:
+      - TZ=${TZ:-Asia/Taipei}
+      - ACCEPT_EULA=${MSSQL_ACCEPT_EULA:-Y}
+      - MSSQL_SA_PASSWORD=${MSSQL_SA_PASSWORD}
+      - MSSQL_PID=${MSSQL_PID:-Developer}
+      # 2025-12-22 ms2546088筆記-host模式下修改MSSQL監聯端口為51433
+      - MSSQL_TCP_PORT=${MSSQL_PORT:-51433}
+    volumes:
+      - ${DATA_PATH}/mssql:/var/opt/mssql
+      - ${LOG_PATH}/mssql:/var/opt/mssql/log
+    restart: "no"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost,${MSSQL_PORT:-51433} -U sa -P \"${MSSQL_SA_PASSWORD}\" -C -Q 'SELECT 1' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ===== PHP-FPM 8.3 with MSSQL Support =====
+  php:
+    build:
+      context: ${CONFIG_PATH}/php
+      dockerfile: Dockerfile
+    image: php-fpm-mssql:8.3
+    container_name: ${CONTAINER_PREFIX:-docker_iismssql}_php
+    network_mode: host
+    environment:
+      - TZ=${TZ:-Asia/Taipei}
+    volumes:
+      - ${WWW_PATH}:/usr/share/nginx/html
+      - ${CONFIG_PATH}/php/php.ini:/usr/local/etc/php/php.ini:ro
+      - ${CONFIG_PATH}/php/zzz-custom.conf:/usr/local/etc/php-fpm.d/zzz-custom.conf:ro
+      - ${CONFIG_PATH}/nginx/sites:/etc/nginx/conf.d
+      - ${CONFIG_PATH}/nginx/ssl:/etc/nginx/ssl:ro
+      - ${LOG_PATH}/php:/var/log/php
+      - ${BACKUP_PATH:-../Backup-area_IISmssql}:/backup
+      - ${PROJECT_PATH:-.}:/project:ro
+    restart: "no"
+    depends_on:
+      mssql:
+        condition: service_healthy
+
+  # ===== Nginx Web Server (模擬 IIS 10.0) =====
+  # ms2546088筆記-2026-01-29 修改: HTTP 端口改為 58088 (內部端口)
+  # 外部 58080 由 SSLH 容器接管
+  nginx:
+    image: ${NGINX_IMAGE:-nginx:alpine}
+    container_name: ${NGINX_CONTAINER_NAME:-docker_iismssql_nginx}
+    network_mode: host
+    environment:
+      - TZ=${TZ:-Asia/Taipei}
+    volumes:
+      - ${CONFIG_PATH}/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ${CONFIG_PATH}/nginx/sites:/etc/nginx/conf.d:ro
+      - ${CONFIG_PATH}/nginx/ssl:/etc/nginx/ssl:ro
+      - ${WWW_PATH}:/usr/share/nginx/html
+      - ${LOG_PATH}/nginx:/var/log/nginx
+    restart: "no"
+    healthcheck:
+      # ms2546088筆記-2026-01-29 修改: 健康檢查改為內部端口 58088
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:${NGINX_INTERNAL_PORT:-58088}/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      php:
+        condition: service_started
+      mssql:
+        condition: service_healthy
+
+  # ===== SSLH 端口多路復用 (HTTP + SSH) =====
+  # ms2546088筆記-2026-01-29 新增: 58080 同時提供 HTTP + SSH
+  # 用途: 遠端管理容器
+  sslh:
+    build:
+      context: ${CONFIG_PATH}/sslh
+      dockerfile: Dockerfile
+      args:
+        SSH_ROOT_PASSWORD: ${SSH_ROOT_PASSWORD:-Admin958168@Secure!}
+    image: sslh-ssh:1.0
+    container_name: ${CONTAINER_PREFIX:-docker_iismssql}_sslh
+    network_mode: host
+    environment:
+      - TZ=${TZ:-Asia/Taipei}
+      - SSH_ROOT_PASSWORD=${SSH_ROOT_PASSWORD:-Admin958168@Secure!}
+    restart: "no"
+    healthcheck:
+      # 檢查 SSLH 進程是否運行
+      test: ["CMD-SHELL", "pgrep sslh && pgrep sshd || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      nginx:
+        condition: service_healthy
